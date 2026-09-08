@@ -1,0 +1,21 @@
+name: Build Vanilla Xash3D Data
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create Folders
+        run: |
+          mkdir -p xash3d_data/{valve,cstrike,czero,gearbox,bshift,tfc,dod}
+          touch xash3d_data/{valve,cstrike,czero,gearbox,bshift,tfc,dod}.game
+      - name: Download extras.pak
+        run: |
+          wget -O xash3d_data/extras.pak https://github.com/FWGS/xash-extras/releases/latest/download/extras.pak
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xash3d-ios-data
+          path: xash3d_data/
