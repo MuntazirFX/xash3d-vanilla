@@ -1,0 +1,12 @@
+#include "AetherGameRuntime.h"
+#include "../weapons/AetherCrowbar.h"
+#include "../weapons/AetherGlock.h"
+#include "../monsters/AetherHeadcrab.h"
+#include <string.h>
+void aether_game_runtime_init(aether_game_runtime_t*g){if(!g)return;memset(g,0,sizeof*g);aether_player_init(&g->player);aether_player_health_init(&g->health);aether_player_inventory_init(&g->inventory);aether_player_death_init(&g->death);aether_crowbar_init(&g->weapon);aether_player_inventory_add_weapon(&g->inventory,AETHER_WEAPON_CROWBAR);g->state=AETHER_GAME_LOADING;}
+void aether_game_runtime_shutdown(aether_game_runtime_t*g){if(g)memset(g,0,sizeof*g);}
+aether_result_t aether_game_runtime_start(aether_game_runtime_t*g,aether_vec3_t p,f32 yaw){if(!g)return AETHER_ERR_INVALID_ARG;g->spawn_position=p;g->spawn_yaw=yaw;g->player.yaw=yaw;g->state=AETHER_GAME_RUNNING;return AETHER_OK;}
+void aether_game_runtime_pause(aether_game_runtime_t*g,bool paused){if(!g)return;if(paused&&g->state==AETHER_GAME_RUNNING)g->state=AETHER_GAME_PAUSED;else if(!paused&&g->state==AETHER_GAME_PAUSED)g->state=AETHER_GAME_RUNNING;}
+void aether_game_runtime_damage_player(aether_game_runtime_t*g,const aether_damage_t*d){if(!g||g->state!=AETHER_GAME_RUNNING)return;if(aether_player_apply_damage(&g->health,d)<=0)return;if(!aether_player_health_alive(&g->health)){aether_player_death_kill(&g->death);g->state=AETHER_GAME_DEAD;}}
+aether_result_t aether_game_runtime_add_monster(aether_game_runtime_t*g,const aether_monster_t*m){if(!g||!m)return AETHER_ERR_INVALID_ARG;if(g->monster_count>=AETHER_RUNTIME_MAX_MONSTERS)return AETHER_ERR_OUT_OF_MEM;g->monsters[g->monster_count++]=*m;return AETHER_OK;}
+void aether_game_runtime_update(aether_game_runtime_t*g,const aether_input_state_t*in,f32 dt){if(!g||!in||g->state!=AETHER_GAME_RUNNING)return;if(dt<0)dt=0;if(dt>0.1f)dt=0.1f;g->time+=dt;g->ticks++;aether_player_update(&g->player,in,NULL,dt);aether_weapon_tick(&g->weapon,dt);if(in->actions[AETHER_ACTION_FIRE]){if(g->weapon.id==AETHER_WEAPON_CROWBAR)aether_crowbar_attack(&g->weapon);else if(g->weapon.id==AETHER_WEAPON_GLOCK)aether_glock_attack(&g->weapon);}for(u32 i=0;i<g->monster_count;i++){aether_monster_t*m=&g->monsters[i];aether_monster_update(m,aether_player_eye_position(&g->player),dt);if(aether_headcrab_can_attack(m)){f32 dmg=aether_headcrab_attack(m);aether_damage_t d={dmg,0.5f,AETHER_DAMAGE_MELEE,m->position,{0,0,0},m};aether_player_apply_damage(&g->health,&d);}}if(!aether_player_health_alive(&g->health)){aether_player_death_kill(&g->death);g->state=AETHER_GAME_DEAD;}}

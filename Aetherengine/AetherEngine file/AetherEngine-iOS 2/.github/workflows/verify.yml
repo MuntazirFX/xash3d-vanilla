@@ -1,0 +1,41 @@
+name: Verify C Sources
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  compile-c-sources:
+    name: Compile all C sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S build -B /tmp/aether-build -DAETHER_BUILD_TESTS=ON
+
+      - name: Build engine and tests
+        run: cmake --build /tmp/aether-build --parallel 2
+
+      - name: Run tests
+        run: ctest --test-dir /tmp/aether-build --output-on-failure
+
+      - name: Verify game manifests
+        run: |
+          set -e
+          for m in valve bshift gearbox cstrike czero; do
+            test -f "engine/game/manifests/$m.json"
+            echo "OK: $m.json"
+          done
+
+      - name: Verify iOS sources
+        run: |
+          set -e
+          for s in AetherApp.swift DashboardView.swift SettingsView.swift             TouchControlsView.swift EngineBridge.c EngineBridge.h             AetherAudioIOS.swift MetalRenderer.swift MetalCallbacks.swift             Shaders.metal Bridging-Header.h; do
+            test -f "ios/AetherApp/$s"
+            echo "OK: $s"
+          done

@@ -1,0 +1,839 @@
+// EngineBridge.c — AetherEngine-iOS · Clean-room.
+// STEP 17A: Entity diagnostics.
+
+#include "EngineBridge.h"
+
+#include "../../engine/core/AetherEngine.h"
+#include "../../engine/game/AetherGameManager.h"
+#include "../../engine/input/AetherInput.h"
+#include "../../engine/config/AetherSettings.h"
+#include "../../engine/fs/AetherFS.h"
+#include "../../engine/audio/AetherAudio.h"
+#include "../../engine/render/AetherRender.h"
+#include "../../engine/bsp/AetherBSP.h"
+#include "../../engine/bsp/AetherBSPGeometry.h"
+#include "../../engine/player/AetherPlayer.h"
+#include "../../engine/player/AetherCollision.h"
+#include "../../engine/texture/AetherTexture.h"
+#include "../../engine/model/AetherMDL.h"
+#include "../../engine/model/AetherMDLGeometry.h"
+#include "../../engine/model/AetherMDLSequence.h"
+#include "../../engine/model/AetherMDLPose.h"
+#include "../../engine/anim/AetherMDLAnimator.h"
+#include "../../engine/entity/AetherEntity.h"
+#include "../../engine/game/runtime/AetherGameRuntime.h"
+#include "../../engine/game/monsters/AetherHeadcrab.h"
+#include "../../engine/game/AetherPickup.h"
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+/* ---------- Globals ---------- */
+static aether_engine_t         *g_engine       = NULL;
+static aether_game_manager_t   *g_game_manager = NULL;
+static aether_input_t          *g_input        = NULL;
+static aether_settings_t       *g_settings     = NULL;
+static aether_fs_t             *g_fs           = NULL;
+static aether_audio_t          *g_audio        = NULL;
+static aether_renderer_t       *g_renderer     = NULL;
+static aether_mesh_t           *g_active_mesh  = NULL;
+static aether_collision_t      *g_collision    = NULL;
+static aether_texture_atlas_t  *g_atlas        = NULL;
+static aether_mdl_t             *g_mdl          = NULL;
+static aether_mdl_sequence_set_t g_mdl_sequences = {0};
+static aether_mdl_animator_t    g_mdl_animator;
+static aether_mdl_pose_t        g_mdl_pose;
+static bool                     g_mdl_animator_ready = false;
+static f32                      *g_mdl_skinned_pos = NULL;
+static f32                      *g_mdl_skinned_norm = NULL;
+static u32                       g_mdl_skinned_capacity = 0;
+static aether_model_mesh_t     *g_mdl_mesh     = NULL;
+static aether_entity_list_t    *g_entities     = NULL;
+static aether_palette_t         g_palette;
+static aether_player_t          g_player;
+static aether_game_runtime_t    g_runtime;
+static bool                     g_runtime_ready = false;
+static char                     g_base_path[512] = {0};
+static float                    g_mdl_render_pos[3] = { 0, 0, 0 };
+
+/* ---------- Metal hooks ---------- */
+extern int32_t aether_metal_init_swift    (void *user, uint32_t w, uint32_t h);
+extern int32_t aether_metal_resize_swift  (void *user, uint32_t w, uint32_t h);
+extern int32_t aether_metal_submit_swift  (void *user, const void *cmd);
+extern int32_t aether_metal_shutdown_swift(void *user);
+
+aether_result_t aether_metal_init    (void *u, u32 w, u32 h) { return (aether_result_t)aether_metal_init_swift(u, (uint32_t)w, (uint32_t)h); }
+aether_result_t aether_metal_resize  (void *u, u32 w, u32 h) { return (aether_result_t)aether_metal_resize_swift(u, (uint32_t)w, (uint32_t)h); }
+aether_result_t aether_metal_submit  (void *u, const aether_render_cmd_t *c) { return (aether_result_t)aether_metal_submit_swift(u, c); }
+aether_result_t aether_metal_shutdown(void *u) { return (aether_result_t)aether_metal_shutdown_swift(u); }
+
+/* ---------- Helpers ---------- */
+static aether_input_action_t map_action_name(const char *n) {
+    if (!n) return AETHER_ACTION_NONE;
+    if (strcmp(n, "fire")        == 0) return AETHER_ACTION_FIRE;
+    if (strcmp(n, "jump")        == 0) return AETHER_ACTION_JUMP;
+    if (strcmp(n, "duck")        == 0) return AETHER_ACTION_DUCK;
+    if (strcmp(n, "use")         == 0) return AETHER_ACTION_USE;
+    if (strcmp(n, "reload")      == 0) return AETHER_ACTION_RELOAD;
+    if (strcmp(n, "weapon_next") == 0) return AETHER_ACTION_WEAPON_NEXT;
+    if (strcmp(n, "weapon_prev") == 0) return AETHER_ACTION_WEAPON_PREV;
+    if (strcmp(n, "pause")       == 0) return AETHER_ACTION_PAUSE;
+    if (strcmp(n, "scoreboard")  == 0) return AETHER_ACTION_SCOREBOARD;
+    return AETHER_ACTION_NONE;
+}
+
+/* ---------- Engine lifecycle ---------- */
+void engine_init(const char *base_path, const char *asset_path) {
+    if (g_engine) return;
+    if (!base_path || !asset_path) return;
+    aether_str_copy(g_base_path, sizeof g_base_path, base_path);
+    aether_log(AETHER_LOG_INFO, "bridge", "base_path = %s", g_base_path);
+
+    g_settings = aether_settings_create();
+    aether_settings_register_engine_defaults(g_settings);
+    g_fs       = aether_fs_create(base_path);
+    g_input    = aether_input_create();
+    g_audio    = aether_audio_create();
+    aether_audio_init(g_audio);
+    g_renderer = aether_renderer_create(AETHER_RENDER_METAL, NULL);
+    aether_player_init(&g_player);
+    aether_game_runtime_init(&g_runtime);
+    g_runtime_ready = true;
+
+    aether_engine_desc_t desc = { .base_path = base_path, .asset_path = asset_path, .flags = 0 };
+    g_engine = aether_engine_create(&desc);
+    if (!g_engine) return;
+    if (aether_engine_start(g_engine) != AETHER_OK) return;
+    g_game_manager = aether_game_manager_create(g_engine, base_path);
+    aether_log(AETHER_LOG_INFO, "bridge", "engine fully initialized (%s)", AETHER_VERSION_STRING);
+}
+
+void engine_shutdown(void) {
+    if (g_entities)     { aether_entity_list_free(g_entities); g_entities = NULL; }
+    if (g_mdl_mesh)     { aether_mdl_geometry_free(g_mdl_mesh); g_mdl_mesh = NULL; }
+    if (g_mdl_skinned_pos) { free(g_mdl_skinned_pos); g_mdl_skinned_pos = NULL; }
+    if (g_mdl_skinned_norm) { free(g_mdl_skinned_norm); g_mdl_skinned_norm = NULL; }
+    g_mdl_skinned_capacity = 0;
+    aether_mdl_pose_free(&g_mdl_pose);
+    aether_mdl_sequences_free(&g_mdl_sequences);
+    g_mdl_animator_ready = false;
+    if (g_mdl) { aether_mdl_free(g_mdl); g_mdl = NULL; }
+    if (g_atlas)        { aether_texture_atlas_free(g_atlas); g_atlas = NULL; }
+    if (g_collision)    { if (g_runtime_ready) aether_game_runtime_set_collision(&g_runtime, NULL); aether_collision_free(g_collision); g_collision = NULL; }
+    if (g_runtime_ready) { aether_game_runtime_shutdown(&g_runtime); g_runtime_ready = false; }
+    if (g_active_mesh)  { aether_mesh_free(g_active_mesh); g_active_mesh = NULL; }
+    if (g_game_manager) { aether_game_manager_destroy(g_game_manager); g_game_manager = NULL; }
+    if (g_engine)       { aether_engine_stop(g_engine); aether_engine_destroy(g_engine); g_engine = NULL; }
+    if (g_input)        { aether_input_destroy(g_input); g_input = NULL; }
+    if (g_fs)           { aether_fs_destroy(g_fs); g_fs = NULL; }
+    if (g_settings)     { aether_settings_destroy(g_settings); g_settings = NULL; }
+    if (g_audio)        { aether_audio_shutdown(g_audio); aether_audio_destroy(g_audio); g_audio = NULL; }
+    if (g_renderer)     { aether_renderer_shutdown(g_renderer); aether_renderer_destroy(g_renderer); g_renderer = NULL; }
+    aether_log(AETHER_LOG_INFO, "bridge", "engine shutdown complete");
+}
+
+/* ---------- Game lifecycle ---------- */
+void engine_launch_game(const char *game_dir) {
+    if (!g_game_manager || !g_fs || !game_dir) return;
+    const aether_game_info_t *info = aether_game_info_by_dir(game_dir);
+    if (!info) return;
+    if (aether_game_select(g_game_manager, info->id) != AETHER_OK) return;
+    if (aether_game_initialize(g_game_manager)      != AETHER_OK) return;
+
+    aether_fs_clear_roots(g_fs);
+    char valve_dir[600];
+    snprintf(valve_dir, sizeof valve_dir, "%s/valve", g_base_path);
+    if (aether_fs_add_root(g_fs, valve_dir) == AETHER_OK)
+        (void)aether_fs_auto_mount_paks(g_fs, valve_dir);
+
+    if (!aether_str_eq(info->dir_name, "valve")) {
+        char gd[600];
+        if (aether_game_resolve_path(g_game_manager, info->id, gd, sizeof gd) == AETHER_OK) {
+            if (aether_fs_add_root(g_fs, gd) == AETHER_OK)
+                (void)aether_fs_auto_mount_paks(g_fs, gd);
+        }
+    }
+    aether_game_launch(g_game_manager);
+}
+
+void engine_stop_game(void) { if (g_game_manager) aether_game_shutdown(g_game_manager); }
+
+/* ---------- Input ---------- */
+void engine_input_set_move(float x, float y)   { if (g_input) aether_input_set_move(g_input, x, y); }
+void engine_input_add_look(float dx, float dy) { if (g_input) aether_input_add_look(g_input, dx, dy); }
+void engine_input_set_action(const char *n, bool p) {
+    if (!g_input || !n) return;
+    aether_input_action_t a = map_action_name(n);
+    if (a != AETHER_ACTION_NONE) aether_input_set_action(g_input, a, p);
+}
+
+/* ---------- Player ---------- */
+void engine_player_spawn_at_mesh_center(void) {
+    if (!g_active_mesh || !g_runtime_ready) return;
+    aether_vec3_t c = {
+        g_active_mesh->bounds_center[0],
+        g_active_mesh->bounds_center[1],
+        g_active_mesh->bounds_center[2] + 50.0f
+    };
+    (void)aether_game_runtime_start(&g_runtime, c, 0.0f);
+    g_player = g_runtime.player;
+    aether_log(AETHER_LOG_INFO, "player", "spawned at (%.1f, %.1f, %.1f)", c.x, c.y, c.z);
+}
+
+void engine_player_tick(float dt) {
+    if (!g_input || !g_runtime_ready) return;
+    aether_input_begin_frame(g_input);
+    const aether_input_state_t *st = aether_input_state(g_input);
+    aether_game_runtime_update(&g_runtime, st, dt);
+    g_player = g_runtime.player;
+    aether_input_end_frame(g_input);
+}
+
+void engine_game_tick(float dt) { engine_player_tick(dt); }
+int engine_game_state(void) { return g_runtime_ready ? (int)aether_game_runtime_state(&g_runtime) : 0; }
+float engine_game_health(void) { const aether_player_health_t *h = aether_game_runtime_health(&g_runtime); return h ? h->health : 0.0f; }
+float engine_game_armor(void) { const aether_player_health_t *h = aether_game_runtime_health(&g_runtime); return h ? h->armor : 0.0f; }
+int engine_game_weapon_id(void) { const aether_weapon_t *w = aether_game_runtime_weapon(&g_runtime); return w ? (int)w->id : 0; }
+int engine_game_weapon_clip(void) { const aether_weapon_t *w = aether_game_runtime_weapon(&g_runtime); return w ? w->clip : 0; }
+int engine_game_weapon_reserve(void) { const aether_weapon_t *w = aether_game_runtime_weapon(&g_runtime); return w ? w->ammo : 0; }
+unsigned int engine_game_monster_count(void) { return g_runtime_ready ? aether_game_runtime_monster_count(&g_runtime) : 0; }
+unsigned int engine_game_monsters_alive(void) {
+    if (!g_runtime_ready) return 0;
+    unsigned int n = 0;
+    for (u32 i = 0; i < g_runtime.monster_count; ++i) if (g_runtime.monsters[i].alive) ++n;
+    return n;
+}
+unsigned int engine_game_shots_fired(void) { return g_runtime_ready ? g_runtime.shots_fired : 0; }
+unsigned int engine_game_shots_hit(void) { return g_runtime_ready ? g_runtime.shots_hit : 0; }
+unsigned int engine_game_monsters_killed(void) { return g_runtime_ready ? g_runtime.monsters_killed : 0; }
+unsigned int engine_game_pickup_count(void) { return g_runtime_ready ? aether_game_runtime_pickup_count(&g_runtime) : 0; }
+const char *engine_game_weapon_name(void) { return g_runtime_ready ? aether_weapon_name(g_runtime.active_weapon) : "None"; }
+float engine_game_damage_flash(void) { return g_runtime_ready ? g_runtime.hud.damage_flash : 0.0f; }
+const char *engine_game_hud_message(void) { return g_runtime_ready ? g_runtime.hud.message : ""; }
+const char *engine_game_viewmodel_path(void) {
+    return g_runtime_ready ? aether_combat_presentation_viewmodel(&g_runtime.presentation) : "";
+}
+float engine_game_muzzle_flash(void) {
+    return g_runtime_ready ? aether_combat_presentation_muzzle_flash(&g_runtime.presentation) : 0.0f;
+}
+float engine_game_recoil_pitch(void) {
+    return g_runtime_ready ? aether_combat_presentation_recoil_pitch(&g_runtime.presentation) : 0.0f;
+}
+float engine_game_recoil_yaw(void) {
+    return g_runtime_ready ? aether_combat_presentation_recoil_yaw(&g_runtime.presentation) : 0.0f;
+}
+const char *engine_game_presentation_event(void) {
+    return g_runtime_ready ? aether_combat_presentation_event_text(&g_runtime.presentation) : "";
+}
+int engine_game_last_event_type(void) { return g_runtime_ready ? (int)g_runtime.last_event.type : 0; }
+int engine_game_last_event_weapon(void) { return g_runtime_ready ? (int)g_runtime.last_event.weapon : 0; }
+unsigned int engine_game_last_event_target(void) { return g_runtime_ready ? g_runtime.last_event.target_id : 0; }
+float engine_game_last_event_damage(void) { return g_runtime_ready ? g_runtime.last_event.damage : 0.0f; }
+void engine_game_clear_last_event(void) { if (g_runtime_ready) aether_game_runtime_clear_event(&g_runtime); }
+
+void engine_player_get_eye(float out[3]) {
+    aether_vec3_t e = aether_player_eye_position(&g_player);
+    out[0] = e.x; out[1] = e.y; out[2] = e.z;
+}
+void engine_player_get_forward(float out[3]) {
+    aether_vec3_t f = aether_player_forward(&g_player);
+    out[0] = f.x; out[1] = f.y; out[2] = f.z;
+}
+void engine_player_get_position(float out[3]) {
+    out[0] = g_player.position.x; out[1] = g_player.position.y; out[2] = g_player.position.z;
+}
+void engine_player_set_position(float x, float y, float z) {
+    aether_player_set_position(&g_player, (aether_vec3_t){x,y,z});
+    if (g_runtime_ready) g_runtime.player = g_player;
+}
+void  engine_player_set_angles(float y, float p) { g_player.yaw = y; g_player.pitch = p; if (g_runtime_ready) { g_runtime.player.yaw = y; g_runtime.player.pitch = p; } }
+float engine_player_get_yaw(void)   { return g_player.yaw; }
+float engine_player_get_pitch(void) { return g_player.pitch; }
+
+/* ---------- Settings ---------- */
+void engine_settings_save(const char *f) { if (g_settings && f) (void)aether_settings_save(g_settings, f); }
+void engine_settings_load(const char *f) { if (g_settings && f) (void)aether_settings_load(g_settings, f); }
+
+/* ---------- Audio ---------- */
+void engine_audio_init(void)                 { if (!g_audio) g_audio = aether_audio_create(); aether_audio_init(g_audio); }
+void engine_audio_shutdown(void)             { if (g_audio) aether_audio_shutdown(g_audio); }
+void engine_audio_set_master_volume(float v) { if (g_audio) aether_audio_set_master_volume(g_audio, v); }
+void engine_audio_set_mute(bool m)           { if (g_audio) aether_audio_set_mute(g_audio, m); }
+void engine_audio_play(const char *p, float v, bool l) { if (g_audio && p) (void)aether_audio_play_effect(g_audio, p, v, l); }
+void engine_audio_stop_all(void)             { if (g_audio) aether_audio_stop_all(g_audio); }
+
+/* ---------- Renderer ---------- */
+void engine_renderer_attach_metal(void *v) {
+    if (!g_renderer) return;
+    (void)aether_renderer_install_metal(g_renderer, v);
+    (void)aether_renderer_init(g_renderer, 1080, 1920);
+}
+void engine_renderer_resize(unsigned int w, unsigned int h) { if (g_renderer) (void)aether_renderer_resize(g_renderer, w, h); }
+void engine_renderer_begin_frame(void) { if (g_renderer) (void)aether_renderer_begin_frame(g_renderer, 0.05f, 0.05f, 0.08f, 1.0f); }
+void engine_renderer_end_frame(void)   { if (g_renderer) (void)aether_renderer_end_frame(g_renderer); }
+
+/* ---------- BSP inspect ---------- */
+int engine_bsp_inspect(const char *p) {
+    if (!p) return 0;
+    aether_bsp_t *b = aether_bsp_load(p);
+    if (!b) return 0;
+    aether_bsp_dump(b); aether_bsp_free(b); return 1;
+}
+int engine_bsp_inspect_vfs(const char *vp) {
+    if (!g_fs || !vp) return 0;
+    u32 sz = aether_fs_read_file(g_fs, vp, NULL, 0);
+    if (sz == 0) return 0;
+    u8 *buf = (u8*)malloc(sz); if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, vp, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+    aether_bsp_t *b = aether_bsp_load_from_memory(buf, sz, vp);
+    free(buf); if (!b) return 0;
+    aether_bsp_dump(b); aether_bsp_free(b); return 1;
+}
+int engine_bsp_inspect_vfs_text(const char *vp, char *ob, int cap) {
+    if (!g_fs || !vp || !ob || cap <= 0) return -1;
+    u32 sz = aether_fs_read_file(g_fs, vp, NULL, 0);
+    if (sz == 0) { snprintf(ob, (size_t)cap, "NOT FOUND: %s", vp); return 0; }
+    snprintf(ob, (size_t)cap, "Found %u bytes: %s", sz, vp);
+    return 1;
+}
+
+/* ---------- BSP mesh + collision + atlas ---------- */
+int engine_bsp_mesh_build(const char *vp) {
+    if (!g_fs || !vp) return 0;
+    if (g_entities)    { aether_entity_list_free(g_entities); g_entities = NULL; }
+    if (g_atlas)       { aether_texture_atlas_free(g_atlas); g_atlas = NULL; }
+    if (g_active_mesh) { aether_mesh_free(g_active_mesh); g_active_mesh = NULL; }
+    if (g_collision)   { if (g_runtime_ready) aether_game_runtime_set_collision(&g_runtime, NULL); aether_collision_free(g_collision); g_collision = NULL; }
+
+    u32 sz = aether_fs_read_file(g_fs, vp, NULL, 0);
+    if (sz == 0 || sz > 64u*1024u*1024u) return 0;
+    u8 *buf = (u8*)malloc(sz);
+    if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, vp, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+    aether_bsp_t *b = aether_bsp_load_from_memory(buf, sz, vp);
+    free(buf);
+    if (!b) return 0;
+
+    if (!g_palette.loaded) {
+        u32 wad_sz = aether_fs_read_file(g_fs, "halflife.wad", NULL, 0);
+        if (wad_sz > 0 && wad_sz < 256u*1024u*1024u) {
+            u8 *wbuf = (u8*)malloc(wad_sz);
+            if (wbuf) {
+                u32 gw = aether_fs_read_file(g_fs, "halflife.wad", wbuf, wad_sz);
+                if (gw == wad_sz) {
+                    aether_wad_t *w = aether_wad_load_from_memory(wbuf, wad_sz, "halflife.wad");
+                    if (w) { (void)aether_palette_from_wad(&g_palette, w); aether_wad_free(w); }
+                }
+                free(wbuf);
+            }
+        }
+        if (!g_palette.loaded) aether_palette_default(&g_palette);
+    }
+
+    g_atlas = aether_texture_atlas_build(b, &g_palette);
+    if (g_atlas) aether_texture_atlas_dump(g_atlas);
+
+    aether_mesh_t *m = NULL;
+    if (aether_mesh_from_bsp(b, g_atlas, &m) != AETHER_OK || !m) {
+        aether_bsp_free(b); return 0;
+    }
+    g_active_mesh = m;
+
+    g_collision = aether_collision_build(b);
+    if (g_collision) {
+        aether_collision_dump(g_collision);
+        if (g_runtime_ready) aether_game_runtime_set_collision(&g_runtime, g_collision);
+    }
+
+    /* Parse entities and seed the first gameplay runtime. */
+    g_entities = aether_entity_list_from_bsp(b);
+    if (g_entities) {
+        aether_entity_list_dump(g_entities);
+        if (g_runtime_ready) {
+            const aether_entity_t *spawn = aether_entity_find_first(g_entities, AETHER_ENTITY_PLAYER_START);
+            aether_vec3_t pos = {0, 0, 0};
+            f32 yaw = 0.0f;
+            if (spawn) {
+                pos = (aether_vec3_t){spawn->origin[0], spawn->origin[1], spawn->origin[2]};
+                yaw = spawn->angles[1] * 3.14159265359f / 180.0f;
+            } else if (g_active_mesh) {
+                pos = (aether_vec3_t){g_active_mesh->bounds_center[0], g_active_mesh->bounds_center[1], g_active_mesh->bounds_center[2] + 50.0f};
+            }
+            (void)aether_game_runtime_start(&g_runtime, pos, yaw);
+            for (u32 i = 0; i < aether_entity_list_count(g_entities); ++i) {
+                const aether_entity_t *e = aether_entity_at(g_entities, i);
+                if (e && strcmp(e->classname, "monster_headcrab") == 0) {
+                    aether_monster_t m;
+                    aether_headcrab_init(&m, i + 1,
+                        (aether_vec3_t){e->origin[0], e->origin[1], e->origin[2]});
+                    (void)aether_game_runtime_add_monster(&g_runtime, &m);
+                }
+            }
+            for (u32 i = 0; i < aether_entity_list_count(g_entities); ++i) {
+                const aether_entity_t *e = aether_entity_at(g_entities, i);
+                if (!e) continue;
+                aether_pickup_t p;
+                aether_vec3_t pos = { e->origin[0], e->origin[1], e->origin[2] };
+                bool add = true;
+                if (strcmp(e->classname, "weapon_9mmhandgun") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_WEAPON, AETHER_WEAPON_GLOCK, NULL, 0, 0);
+                else if (strcmp(e->classname, "weapon_crowbar") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_WEAPON, AETHER_WEAPON_CROWBAR, NULL, 0, 0);
+                else if (strcmp(e->classname, "item_healthkit") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_HEALTH, AETHER_WEAPON_NONE, NULL, 25, 100);
+                else if (strcmp(e->classname, "item_battery") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_ARMOR, AETHER_WEAPON_NONE, NULL, 15, 100);
+                else if (strcmp(e->classname, "item_suit") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_SUIT, AETHER_WEAPON_NONE, NULL, 1, 1);
+                else if (strcmp(e->classname, "ammo_9mmclip") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_AMMO, AETHER_WEAPON_NONE, "9mm", 17, 250);
+                else if (strcmp(e->classname, "ammo_9mmAR") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_AMMO, AETHER_WEAPON_NONE, "9mm", 50, 250);
+                else if (strcmp(e->classname, "ammo_buckshot") == 0)
+                    aether_pickup_init(&p, i + 1, e->classname, pos, AETHER_PICKUP_AMMO, AETHER_WEAPON_NONE, "buckshot", 12, 125);
+                else add = false;
+                if (add) (void)aether_game_runtime_add_pickup(&g_runtime, &p);
+            }
+            g_player = g_runtime.player;
+        }
+    }
+
+    aether_bsp_free(b);
+    return 1;
+}
+
+int  engine_bsp_mesh_vertex_count(void)   { return g_active_mesh ? (int)g_active_mesh->vertex_count : 0; }
+int  engine_bsp_mesh_index_count(void)    { return g_active_mesh ? (int)g_active_mesh->index_count  : 0; }
+int  engine_bsp_mesh_triangle_count(void) { return g_active_mesh ? (int)(g_active_mesh->index_count / 3) : 0; }
+void engine_bsp_mesh_get_bounds(float *mn, float *mx, float *ctr) {
+    if (!g_active_mesh) return;
+    if (mn)  { mn[0]=g_active_mesh->bounds_min[0];    mn[1]=g_active_mesh->bounds_min[1];    mn[2]=g_active_mesh->bounds_min[2]; }
+    if (mx)  { mx[0]=g_active_mesh->bounds_max[0];    mx[1]=g_active_mesh->bounds_max[1];    mx[2]=g_active_mesh->bounds_max[2]; }
+    if (ctr) { ctr[0]=g_active_mesh->bounds_center[0];ctr[1]=g_active_mesh->bounds_center[1];ctr[2]=g_active_mesh->bounds_center[2]; }
+}
+int engine_bsp_mesh_copy_vertices(float *out, int maxv) {
+    if (!g_active_mesh || !out || maxv <= 0) return 0;
+    int n = (int)g_active_mesh->vertex_count; if (n > maxv) n = maxv;
+    memcpy(out, g_active_mesh->vertices, (size_t)n * sizeof(aether_mesh_vertex_t));
+    return n;
+}
+int engine_bsp_mesh_copy_indices(uint32_t *out, int maxi) {
+    if (!g_active_mesh || !out || maxi <= 0) return 0;
+    int n = (int)g_active_mesh->index_count; if (n > maxi) n = maxi;
+    memcpy(out, g_active_mesh->indices, (size_t)n * sizeof(u32));
+    return n;
+}
+void engine_bsp_mesh_release(void) {
+    if (g_entities)    { aether_entity_list_free(g_entities); g_entities = NULL; }
+    if (g_atlas)       { aether_texture_atlas_free(g_atlas); g_atlas = NULL; }
+    if (g_active_mesh) { aether_mesh_free(g_active_mesh); g_active_mesh = NULL; }
+    if (g_collision)   { if (g_runtime_ready) aether_game_runtime_set_collision(&g_runtime, NULL); aether_collision_free(g_collision); g_collision = NULL; }
+}
+
+/* ---------- Texture / WAD diagnostics ---------- */
+int engine_texture_dump_wad(const char *wad_vpath) {
+    if (!g_fs || !wad_vpath) return 0;
+    u32 sz = aether_fs_read_file(g_fs, wad_vpath, NULL, 0);
+    if (sz == 0 || sz > 256u*1024u*1024u) return 0;
+    u8 *buf = (u8*)malloc(sz); if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, wad_vpath, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+    aether_wad_t *w = aether_wad_load_from_memory(buf, sz, wad_vpath);
+    free(buf); if (!w) return 0;
+    aether_wad_dump(w); aether_wad_free(w); return 1;
+}
+int engine_texture_dump_bsp_miptex(void) {
+    if (!g_fs) return 0;
+    const char *vp = "maps/c0a0.bsp";
+    u32 sz = aether_fs_read_file(g_fs, vp, NULL, 0);
+    if (sz == 0) return 0;
+    u8 *buf = (u8*)malloc(sz); if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, vp, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+    aether_bsp_t *b = aether_bsp_load_from_memory(buf, sz, vp);
+    free(buf); if (!b) return 0;
+    aether_bsp_miptex_dump(b); aether_bsp_free(b); return 1;
+}
+int engine_texture_summary_text(char *out_buf, int out_cap) {
+    if (!g_fs || !out_buf || out_cap <= 0) return -1;
+    int w = 0;
+    w += snprintf(out_buf + w, (size_t)(out_cap - w), "STEP 15A — Texture diagnostics\n\n");
+    const char *bsp_vp = "maps/c0a0.bsp";
+    u32 bsp_sz = aether_fs_read_file(g_fs, bsp_vp, NULL, 0);
+    if (bsp_sz > 0) {
+        u8 *bbuf = (u8*)malloc(bsp_sz);
+        if (bbuf) {
+            u32 got = aether_fs_read_file(g_fs, bsp_vp, bbuf, bsp_sz);
+            if (got == bsp_sz) {
+                aether_bsp_t *b = aether_bsp_load_from_memory(bbuf, bsp_sz, bsp_vp);
+                if (b) {
+                    u32 count = aether_bsp_miptex_count(b);
+                    w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                                  "BSP: c0a0.bsp\n  embedded miptex: %u\n", count);
+                    u32 shown = count > 5 ? 5 : count;
+                    for (u32 i = 0; i < shown; ++i) {
+                        aether_miptex_info_t info;
+                        if (aether_bsp_miptex_info(b, i, &info)) {
+                            w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                                          "  • %s  (%ux%u)\n", info.name, info.width, info.height);
+                        }
+                    }
+                    if (count > shown)
+                        w += snprintf(out_buf + w, (size_t)(out_cap - w), "  … +%u more\n", count - shown);
+                    aether_bsp_free(b);
+                }
+            }
+            free(bbuf);
+        }
+    } else {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w), "BSP: c0a0.bsp NOT FOUND\n");
+    }
+    w += snprintf(out_buf + w, (size_t)(out_cap - w), "\n");
+    const char *wad_vp = "halflife.wad";
+    u32 wad_sz = aether_fs_read_file(g_fs, wad_vp, NULL, 0);
+    if (wad_sz == 0) {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w), "WAD: halflife.wad NOT FOUND\n");
+        return 1;
+    }
+    u8 *wbuf = (u8*)malloc(wad_sz); if (!wbuf) return 1;
+    u32 got = aether_fs_read_file(g_fs, wad_vp, wbuf, wad_sz);
+    if (got != wad_sz) { free(wbuf); return 1; }
+    aether_wad_t *wad = aether_wad_load_from_memory(wbuf, wad_sz, wad_vp);
+    free(wbuf);
+    if (!wad) { w += snprintf(out_buf + w, (size_t)(out_cap - w), "WAD: parse failed\n"); return 1; }
+    u32 total = aether_wad_lump_count(wad);
+    u32 miptex = 0, palette = 0, other = 0;
+    for (u32 i = 0; i < total; ++i) {
+        const aether_wad_lump_t *L = aether_wad_lump_at(wad, i);
+        if (!L) continue;
+        if (L->type == AETHER_WAD_TYPE_MIPTEX) miptex++;
+        else if (L->type == AETHER_WAD_TYPE_PALETTE) palette++;
+        else other++;
+    }
+    w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                  "WAD: halflife.wad (%u bytes)\n  total lumps : %u\n  miptex      : %u\n  palette     : %u\n  other       : %u\n",
+                  wad_sz, total, miptex, palette, other);
+    aether_wad_free(wad);
+    return 1;
+}
+
+/* ---------- Texture atlas ---------- */
+int engine_texture_build_atlas(void)      { return g_atlas ? 1 : 0; }
+int engine_texture_atlas_width(void)      { return g_atlas ? (int)g_atlas->width  : 0; }
+int engine_texture_atlas_height(void)     { return g_atlas ? (int)g_atlas->height : 0; }
+int engine_texture_atlas_slot_count(void) { return g_atlas ? (int)g_atlas->slot_count : 0; }
+int engine_texture_atlas_copy_rgba(unsigned char *out, int max_bytes) {
+    if (!g_atlas || !g_atlas->rgba || !out || max_bytes <= 0) return 0;
+    u32 needed = g_atlas->width * g_atlas->height * 4;
+    if ((u32)max_bytes < needed) return 0;
+    memcpy(out, g_atlas->rgba, needed);
+    return (int)needed;
+}
+
+/* ---------- MDL diagnostics ---------- */
+int engine_mdl_dump_vfs(const char *mdl_vpath) {
+    if (!g_fs || !mdl_vpath) return 0;
+    u32 sz = aether_fs_read_file(g_fs, mdl_vpath, NULL, 0);
+    if (sz == 0 || sz > 64u*1024u*1024u) return 0;
+    u8 *buf = (u8*)malloc(sz);
+    if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, mdl_vpath, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+    aether_mdl_t *m = aether_mdl_load_from_memory(buf, sz, mdl_vpath);
+    free(buf);
+    if (!m) return 0;
+    aether_mdl_dump(m);
+    aether_mdl_free(m);
+    return 1;
+}
+
+int engine_mdl_summary_text(const char *mdl_vpath, char *out_buf, int out_cap) {
+    if (!g_fs || !mdl_vpath || !out_buf || out_cap <= 0) return -1;
+    u32 sz = aether_fs_read_file(g_fs, mdl_vpath, NULL, 0);
+    if (sz == 0) {
+        snprintf(out_buf, (size_t)out_cap,
+                 "❌ MDL NOT FOUND\n\nPath: %s\n\nAapke `valve` folder mein\n`models/<name>.mdl` file\nmojood nahi hai.",
+                 mdl_vpath);
+        return 0;
+    }
+    if (sz > 64u*1024u*1024u) {
+        snprintf(out_buf, (size_t)out_cap, "MDL too large: %u bytes", sz);
+        return -1;
+    }
+    u8 *buf = (u8*)malloc(sz);
+    if (!buf) return -1;
+    u32 got = aether_fs_read_file(g_fs, mdl_vpath, buf, sz);
+    if (got != sz) { free(buf); return -1; }
+    aether_mdl_t *m = aether_mdl_load_from_memory(buf, sz, mdl_vpath);
+    free(buf);
+    if (!m) {
+        snprintf(out_buf, (size_t)out_cap, "❌ MDL PARSE FAILED: %s", mdl_vpath);
+        return -2;
+    }
+
+    const aether_mdl_info_t *info = aether_mdl_info(m);
+    int w = 0;
+    w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                  "✅ MDL Parsed Successfully\n\nFile: %s\nSize: %u bytes\n\n"
+                  "Name       : %s\nBones      : %d\nBodyparts  : %d\nTextures   : %d\n"
+                  "Sequences  : %d\nHitboxes   : %d\nAttachments: %d\n\n",
+                  mdl_vpath, sz, info->name, info->bone_count, info->bodypart_count,
+                  info->texture_count, info->sequence_count, info->hitbox_count,
+                  info->attachment_count);
+
+    if (info->texture_count > 0) {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w), "Textures:\n");
+        int shown = info->texture_count > 5 ? 5 : info->texture_count;
+        for (int i = 0; i < shown; ++i) {
+            const aether_mdl_skin_t *s = aether_mdl_skin_at(m, i);
+            if (s) w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                                 "  • %s (%dx%d)\n", s->name, s->width, s->height);
+        }
+        if (info->texture_count > shown)
+            w += snprintf(out_buf + w, (size_t)(out_cap - w), "  … +%d more\n",
+                          info->texture_count - shown);
+    }
+    aether_mdl_free(m);
+    return 1;
+}
+
+/* ---------- MDL mesh extraction ---------- */
+int engine_mdl_mesh_build(const char *mdl_vpath) {
+    if (!g_fs || !mdl_vpath) return 0;
+    if (g_mdl_mesh) { aether_mdl_geometry_free(g_mdl_mesh); g_mdl_mesh = NULL; }
+
+    u32 sz = aether_fs_read_file(g_fs, mdl_vpath, NULL, 0);
+    if (sz == 0 || sz > 64u*1024u*1024u) return 0;
+    u8 *buf = (u8*)malloc(sz);
+    if (!buf) return 0;
+    u32 got = aether_fs_read_file(g_fs, mdl_vpath, buf, sz);
+    if (got != sz) { free(buf); return 0; }
+
+    aether_mdl_t *mdl = aether_mdl_load_from_memory(buf, sz, mdl_vpath);
+    free(buf);
+    if (!mdl) return 0;
+
+    aether_model_mesh_t *mesh = NULL;
+    aether_result_t r = aether_mdl_geometry_extract(mdl, &mesh);
+    if (r != AETHER_OK || !mesh) { aether_mdl_free(mdl); return 0; }
+
+    aether_mdl_sequence_set_t sequences = {0};
+    (void)aether_mdl_sequences_parse(mdl, &sequences);
+    aether_mdl_pose_init(&g_mdl_pose);
+    aether_mdl_animator_init(&g_mdl_animator);
+    aether_mdl_animator_bind(&g_mdl_animator, &sequences);
+    if (sequences.count > 0) {
+        (void)aether_mdl_animator_play(&g_mdl_animator, 0, true, 1.0f);
+        g_mdl_animator_ready = true;
+    }
+    if (g_mdl) aether_mdl_free(g_mdl);
+    aether_mdl_sequences_free(&g_mdl_sequences);
+    g_mdl = mdl;
+    g_mdl_sequences = sequences;
+    g_mdl_mesh = mesh;
+    aether_mdl_geometry_dump(mesh);
+
+    float fwd[3] = { 1.0f, 0.0f, 0.0f };
+    engine_player_get_forward(fwd);
+    float ply[3] = { 0, 0, 0 };
+    engine_player_get_position(ply);
+    g_mdl_render_pos[0] = ply[0] + fwd[0] * 200.0f;
+    g_mdl_render_pos[1] = ply[1] + fwd[1] * 200.0f;
+    g_mdl_render_pos[2] = ply[2] + fwd[2] * 200.0f;
+    return 1;
+}
+
+int  engine_mdl_mesh_vertex_count(void)   { return g_mdl_mesh ? (int)g_mdl_mesh->vertex_count   : 0; }
+int  engine_mdl_mesh_triangle_count(void) { return g_mdl_mesh ? (int)g_mdl_mesh->triangle_count : 0; }
+
+void engine_mdl_mesh_get_bounds(float *mn, float *mx, float *ctr) {
+    if (!g_mdl_mesh) return;
+    if (mn)  { mn[0]=g_mdl_mesh->bounds_min[0]; mn[1]=g_mdl_mesh->bounds_min[1]; mn[2]=g_mdl_mesh->bounds_min[2]; }
+    if (mx)  { mx[0]=g_mdl_mesh->bounds_max[0]; mx[1]=g_mdl_mesh->bounds_max[1]; mx[2]=g_mdl_mesh->bounds_max[2]; }
+    if (ctr) { ctr[0]=g_mdl_mesh->bounds_center[0]; ctr[1]=g_mdl_mesh->bounds_center[1]; ctr[2]=g_mdl_mesh->bounds_center[2]; }
+}
+
+int engine_mdl_mesh_copy_positions(float *out, int max_floats) {
+    if (!g_mdl_mesh || !out || max_floats <= 0) return 0;
+    int n = (int)(g_mdl_mesh->vertex_count * 3);
+    if (n > max_floats) n = max_floats;
+    memcpy(out, g_mdl_mesh->positions, (size_t)n * sizeof(f32));
+    return n;
+}
+int engine_mdl_mesh_copy_normals(float *out, int max_floats) {
+    if (!g_mdl_mesh || !out || max_floats <= 0) return 0;
+    int n = (int)(g_mdl_mesh->vertex_count * 3);
+    if (n > max_floats) n = max_floats;
+    memcpy(out, g_mdl_mesh->normals, (size_t)n * sizeof(f32));
+    return n;
+}
+int engine_mdl_mesh_copy_uvs(float *out, int max_floats) {
+    if (!g_mdl_mesh || !g_mdl_mesh->uvs || !out || max_floats <= 0) return 0;
+    int n = (int)(g_mdl_mesh->vertex_count * 2);
+    if (n > max_floats) n = max_floats;
+    memcpy(out, g_mdl_mesh->uvs, (size_t)n * sizeof(f32));
+    return n;
+}
+int engine_mdl_mesh_copy_bones(unsigned char *out, int max_bytes) {
+    if (!g_mdl_mesh || !g_mdl_mesh->bone_indices || !out || max_bytes <= 0) return 0;
+    int n = (int)g_mdl_mesh->vertex_count;
+    if (n > max_bytes) n = max_bytes;
+    memcpy(out, g_mdl_mesh->bone_indices, (size_t)n);
+    return n;
+}
+int engine_mdl_mesh_texture_width(void) { return g_mdl_mesh ? (int)g_mdl_mesh->texture_width : 0; }
+int engine_mdl_mesh_texture_height(void) { return g_mdl_mesh ? (int)g_mdl_mesh->texture_height : 0; }
+int engine_mdl_mesh_copy_texture_rgba(unsigned char *out, int max_bytes) {
+    if (!g_mdl_mesh || !g_mdl_mesh->texture_rgba || !out || max_bytes <= 0) return 0;
+    int n = (int)(g_mdl_mesh->texture_width * g_mdl_mesh->texture_height * 4u);
+    if (n > max_bytes) n = max_bytes;
+    memcpy(out, g_mdl_mesh->texture_rgba, (size_t)n);
+    return n;
+}
+
+int engine_mdl_mesh_copy_indices(uint32_t *out, int max_idx) {
+    if (!g_mdl_mesh || !out || max_idx <= 0) return 0;
+    int n = (int)(g_mdl_mesh->triangle_count * 3);
+    if (n > max_idx) n = max_idx;
+    memcpy(out, g_mdl_mesh->indices, (size_t)n * sizeof(u32));
+    return n;
+}
+
+void engine_mdl_mesh_release(void) {
+    if (g_mdl_mesh) { aether_mdl_geometry_free(g_mdl_mesh); g_mdl_mesh = NULL; }
+}
+
+/* ---------- MDL skeletal animation (STEP 16D) ---------- */
+int engine_mdl_animation_sequence_count(void) { return (int)g_mdl_sequences.count; }
+int engine_mdl_animation_play(int sequence, bool looping, float playback_rate) {
+    if (!g_mdl_animator_ready) return 0;
+    return aether_mdl_animator_play(&g_mdl_animator, sequence, looping, playback_rate) ? 1 : 0;
+}
+int engine_mdl_animation_play_name(const char *label, bool looping, float playback_rate) {
+    if (!g_mdl_animator_ready || !label) return 0;
+    const aether_mdl_sequence_t *s = aether_mdl_sequence_find(&g_mdl_sequences, label);
+    if (!s) return 0;
+    int index = (int)(s - g_mdl_sequences.items);
+    return engine_mdl_animation_play(index, looping, playback_rate);
+}
+void engine_mdl_animation_stop(void) { if (g_mdl_animator_ready) aether_mdl_animator_stop(&g_mdl_animator); }
+void engine_mdl_animation_tick(float dt) {
+    if (!g_mdl_animator_ready || !g_mdl || !g_mdl_mesh) return;
+    aether_mdl_animator_update(&g_mdl_animator, dt);
+    const aether_mdl_sequence_t *seq = aether_mdl_animator_current(&g_mdl_animator);
+    if (!seq) return;
+    if (aether_mdl_pose_build(g_mdl, g_mdl_animator.sequence, aether_mdl_animator_frame(&g_mdl_animator),
+                              g_mdl_animator.blend[0], g_mdl_animator.blend[1], &g_mdl_pose) != AETHER_OK) return;
+    u32 n = g_mdl_mesh->vertex_count;
+    if (n > g_mdl_skinned_capacity) {
+        size_t bytes = (size_t)n * 3u * sizeof(f32);
+        f32 *np = (f32*)malloc(bytes);
+        f32 *nn = (f32*)malloc(bytes);
+        if (!np || !nn) { free(np); free(nn); return; }
+        if (g_mdl_skinned_pos && g_mdl_skinned_capacity)
+            memcpy(np, g_mdl_skinned_pos, (size_t)g_mdl_skinned_capacity * 3u * sizeof(f32));
+        if (g_mdl_skinned_norm && g_mdl_skinned_capacity)
+            memcpy(nn, g_mdl_skinned_norm, (size_t)g_mdl_skinned_capacity * 3u * sizeof(f32));
+        free(g_mdl_skinned_pos); free(g_mdl_skinned_norm);
+        g_mdl_skinned_pos=np; g_mdl_skinned_norm=nn; g_mdl_skinned_capacity=n;
+    }
+    (void)aether_mdl_pose_skin_mesh(g_mdl_mesh, &g_mdl_pose, g_mdl_skinned_pos, g_mdl_skinned_norm, n);
+}
+int engine_mdl_animation_sequence(void) { return g_mdl_animator_ready ? g_mdl_animator.sequence : -1; }
+float engine_mdl_animation_frame(void) { return g_mdl_animator_ready ? aether_mdl_animator_frame(&g_mdl_animator) : 0.0f; }
+int engine_mdl_mesh_copy_skinned_positions(float *out, int max_floats) {
+    if (!g_mdl_skinned_pos || !g_mdl_mesh || !out || max_floats <= 0) return 0;
+    int n=(int)(g_mdl_mesh->vertex_count*3u); if(n>max_floats)n=max_floats; memcpy(out,g_mdl_skinned_pos,(size_t)n*sizeof(f32)); return n;
+}
+int engine_mdl_mesh_copy_skinned_normals(float *out, int max_floats) {
+    if (!g_mdl_skinned_norm || !g_mdl_mesh || !out || max_floats <= 0) return 0;
+    int n=(int)(g_mdl_mesh->vertex_count*3u); if(n>max_floats)n=max_floats; memcpy(out,g_mdl_skinned_norm,(size_t)n*sizeof(f32)); return n;
+}
+
+/* ---------- MDL render placement ---------- */
+void engine_mdl_mesh_get_render_pos(float out[3]) {
+    out[0] = g_mdl_render_pos[0];
+    out[1] = g_mdl_render_pos[1];
+    out[2] = g_mdl_render_pos[2];
+}
+
+void engine_mdl_mesh_set_render_pos(float x, float y, float z) {
+    g_mdl_render_pos[0] = x;
+    g_mdl_render_pos[1] = y;
+    g_mdl_render_pos[2] = z;
+}
+
+/* ---------- Entity diagnostics (STEP 17A) ---------- */
+int engine_entity_dump_current_map(void) {
+    if (!g_entities) {
+        aether_log(AETHER_LOG_WARN, "bridge", "entity dump: no entities loaded");
+        return 0;
+    }
+    aether_entity_list_dump(g_entities);
+    return 1;
+}
+
+int engine_entity_summary_text(char *out_buf, int out_cap) {
+    if (!out_buf || out_cap <= 0) return -1;
+
+    int w = 0;
+    w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                  "STEP 17A — Entity diagnostics\n\n");
+
+    if (!g_entities) {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                      "❌ No entities loaded.\n\n"
+                      "First load a map:\n"
+                      "Tap \"Launch Game\" or\n"
+                      "\"Load c0a0.bsp\".");
+        return 0;
+    }
+
+    u32 total = aether_entity_list_count(g_entities);
+    w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                  "Total entities: %u\n\n", total);
+
+    /* Category summary */
+    w += snprintf(out_buf + w, (size_t)(out_cap - w), "Categories:\n");
+    for (u32 c = 0; c < AETHER_ENTITY_CATEGORY_COUNT; ++c) {
+        u32 n = aether_entity_category_count(g_entities, (aether_entity_category_t)c);
+        if (n > 0) {
+            w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                          "  %-14s : %u\n",
+                          aether_entity_category_name((aether_entity_category_t)c), n);
+        }
+    }
+
+    /* Player start */
+    const aether_entity_t *ps = aether_entity_find_first(g_entities, AETHER_ENTITY_PLAYER_START);
+    if (ps) {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                      "\nPlayer start:\n  %s @ (%.0f, %.0f, %.0f)\n",
+                      ps->classname, ps->origin[0], ps->origin[1], ps->origin[2]);
+    } else {
+        w += snprintf(out_buf + w, (size_t)(out_cap - w), "\n⚠️ No player start found\n");
+    }
+
+    /* First few monsters */
+    w += snprintf(out_buf + w, (size_t)(out_cap - w), "\nFirst few monsters:\n");
+    u32 shown = 0;
+    for (u32 i = 0; i < total && shown < 5; ++i) {
+        const aether_entity_t *e = aether_entity_at(g_entities, i);
+        if (e && e->category == AETHER_ENTITY_MONSTER) {
+            w += snprintf(out_buf + w, (size_t)(out_cap - w),
+                          "  %-24s @ (%.0f, %.0f, %.0f)\n",
+                          e->classname, e->origin[0], e->origin[1], e->origin[2]);
+            shown++;
+        }
+    }
+    if (shown == 0) w += snprintf(out_buf + w, (size_t)(out_cap - w), "  (none)\n");
+
+    return 1;
+}
+
+/* ---------- Utility ---------- */
+const char *engine_base_path(void) { return g_base_path; }
+const char *engine_version(void)   { return AETHER_VERSION_STRING; }
